@@ -377,7 +377,11 @@ defmodule Firecrawl do
   Search GitHub research content.
 
   `GET /search/research/github`
+
+  Deprecated: stops responding after 2026-11-03. Use `search_developer/2`, which
+  does not carry over the score breakdown or the web fallback results.
   """
+  @deprecated "Use search_developer/2; the endpoint stops responding after 2026-11-03"
   @spec search_github(keyword(), keyword()) :: response()
   def search_github(params \\ [], opts \\ []) do
     with {:ok, params} <- NimbleOptions.validate(params, @research_search_github_schema) do
@@ -387,11 +391,101 @@ defmodule Firecrawl do
 
   @doc """
   Bang variant of `search_github`. Raises on error.
+
+  Deprecated: use `search_developer!/2`.
   """
+  @deprecated "Use search_developer!/2; the endpoint stops responding after 2026-11-03"
   @spec search_github!(keyword(), keyword()) :: Req.Response.t()
   def search_github!(params \\ [], opts \\ []) do
     params = NimbleOptions.validate!(params, @research_search_github_schema)
     Req.get!(client(opts), url: "/search/research/github", params: [{"origin", @sdk_origin} | to_query(params, @research_search_github_key_mapping)])
+  end
+
+  @search_developer_schema NimbleOptions.new!([
+    query: [type: :string, required: true, doc: "Natural-language question or search phrase. Must not be blank."],
+    k: [type: :integer, doc: "Total ranked results, 1 to 100 (default 10)."],
+    passages: [type: :integer, doc: "Passages per result, 1 to 5 (default 1)."],
+    types: [type: {:list, :string}, doc: "Result kinds: `doc`, `issue`, `pull_request`, `readme` (default all)."],
+    repos: [type: {:list, :string}, doc: "GitHub `owner/name` filters, at most 20."],
+    sources: [type: {:list, :string}, doc: "Developer documentation source ids, at most 20."],
+    language: [type: :string, doc: "One case-insensitive GitHub Linguist primary language."],
+    topic: [type: {:or, [:string, {:list, :string}]}, doc: "Repository topic, or topics that must all match."],
+    license: [type: :string, doc: "One case-insensitive SPDX repository license identifier."],
+    min_stars: [type: :integer, doc: "Lower bound on repository stars."],
+    max_stars: [type: :integer, doc: "Upper bound on repository stars."],
+    archived: [type: :boolean, doc: "Include or exclude archived repositories."],
+    fork: [type: :boolean, doc: "Include or exclude forks."],
+    skills: [type: {:or, [{:in, [:only]}, :string]}, doc: "Set to `only` to return packaged agent-skill evidence only."]
+  ])
+
+  @search_developer_key_mapping %{query: "query", k: "k", passages: "passages", types: "types", repos: "repos", sources: "sources", language: "language", topic: "topic", license: "license", min_stars: "min_stars", max_stars: "max_stars", archived: "archived", fork: "fork", skills: "skills"}
+
+  @doc """
+  Search the developer index: public repositories, GitHub issues, merged pull
+  requests, READMEs and code documentation. Replaces the deprecated `search_github/2`.
+
+  `POST /search/developer`
+
+  Tag: Developer
+
+  ## Parameters
+
+  Validated by `NimbleOptions`. A blank `query` is rejected before any request is sent.
+
+  #{NimbleOptions.docs(@search_developer_schema)}
+
+  ## Returns
+
+    * `{:ok, %Firecrawl.DeveloperSearch{}}` on success
+    * `{:error, exception}` on a blank query, validation failure, HTTP failure or an unexpected response shape
+
+  ## Example
+
+      {:ok, %Firecrawl.DeveloperSearch{results: results}} =
+        Firecrawl.search_developer(query: "retry an http request", repos: ["square/okhttp"], k: 5)
+  """
+  @spec search_developer(keyword(), keyword()) ::
+          {:ok, Firecrawl.DeveloperSearch.t()} | {:error, Exception.t() | Firecrawl.Error.t()}
+  def search_developer(params \\ [], opts \\ []) do
+    with {:ok, params} <- NimbleOptions.validate(params, @search_developer_schema),
+         :ok <- validate_query(params[:query]),
+         {:ok, response} <-
+           Req.post(client(opts), url: "/search/developer", json: to_body(params, @search_developer_key_mapping)) do
+      decode_developer_search(response)
+    end
+  end
+
+  @doc """
+  Bang variant of `search_developer`. Raises on error.
+  """
+  @spec search_developer!(keyword(), keyword()) :: Firecrawl.DeveloperSearch.t()
+  def search_developer!(params \\ [], opts \\ []) do
+    case search_developer(params, opts) do
+      {:ok, result} -> result
+      {:error, exception} -> raise exception
+    end
+  end
+
+  defp validate_query(query) do
+    if String.trim(query) == "" do
+      {:error, %ArgumentError{message: "query cannot be empty"}}
+    else
+      :ok
+    end
+  end
+
+  defp decode_developer_search(%Req.Response{body: %{"results" => results} = body})
+       when is_list(results) do
+    {:ok, Firecrawl.DeveloperSearch.from_map(body)}
+  rescue
+    exception -> {:error, exception}
+  end
+
+  defp decode_developer_search(%Req.Response{status: status, body: body}) do
+    {:error,
+     RuntimeError.exception(
+       "unexpected POST /search/developer response (HTTP #{status}): #{inspect(body)}"
+     )}
   end
 
   @monitor_key_mapping %{
@@ -1581,10 +1675,15 @@ defmodule Firecrawl do
 
   @gov_search_query_schema NimbleOptions.new!([
     query: [type: :string, required: true, doc: "Natural-language question or search phrase."],
-    k: [type: :integer, doc: "Number of results to return."]
+    k: [type: :integer, doc: "Number of results to return."],
+    jurisdiction: [type: :string, doc: "Keep only pages of one jurisdiction: `us` for federal, or `us-` plus a two-letter state or territory code, such as `us-ca` or `us-dc`."],
+    court: [type: :string, doc: "Keep only pages labeled for one court, by CourtListener court id, such as `scotus`, `ca9` or `nysd`."],
+    court_type: [type: {:or, [{:in, [:"federal-supreme", :"federal-appellate", :"federal-district", :"federal-bankruptcy", :"federal-special", :military, :"state-supreme", :"state-appellate", :"state-trial", :"state-special", :"state-attorney-general"]}, :string]}, doc: "Keep only pages from one type of court: `federal-supreme`, `federal-appellate`, `federal-district`, `federal-bankruptcy`, `federal-special`, `military`, `state-supreme`, `state-appellate`, `state-trial`, `state-special`, `state-attorney-general`."],
+    cites: [type: :string, doc: "Keep only pages that cite one law or case, as a printed citation such as `42 U.S.C. § 1983` or `5 U.S. 137`, or a citation id such as `us:usc:42:1983`."],
+    domain: [type: :string, doc: "Keep only pages from one site, such as `irs.gov`."]
   ])
 
-  @gov_search_query_key_mapping %{query: "query", k: "k"}
+  @gov_search_query_key_mapping %{query: "query", k: "k", jurisdiction: "jurisdiction", court: "court", court_type: "courtType", cites: "cites", domain: "domain"}
 
   @doc """
   Search the Government Index
@@ -1597,6 +1696,11 @@ defmodule Firecrawl do
 
     * `query` — query parameter `query`
     * `k` — query parameter `k`
+    * `jurisdiction` — query parameter `jurisdiction`
+    * `court` — query parameter `court`
+    * `court_type` — query parameter `courtType`
+    * `cites` — query parameter `cites`
+    * `domain` — query parameter `domain`
 
   ## Returns
 
@@ -1622,11 +1726,16 @@ defmodule Firecrawl do
 
 
   @gov_search_post_schema NimbleOptions.new!([
+    cites: [type: :string, doc: "Keep only pages that cite one law or case, as a printed citation such as `42 U.S.C. § 1983` or `5 U.S. 137`, or a citation id such as `us:usc:42:1983`."],
+    court: [type: :string, doc: "Keep only pages labeled for one court, by CourtListener court id, such as `scotus`, `ca9` or `nysd`."],
+    court_type: [type: {:or, [{:in, [:"federal-supreme", :"federal-appellate", :"federal-district", :"federal-bankruptcy", :"federal-special", :military, :"state-supreme", :"state-appellate", :"state-trial", :"state-special", :"state-attorney-general"]}, :string]}, doc: "Keep only pages from one type of court: `federal-supreme`, `federal-appellate`, `federal-district`, `federal-bankruptcy`, `federal-special`, `military`, `state-supreme`, `state-appellate`, `state-trial`, `state-special`, `state-attorney-general`."],
+    domain: [type: :string, doc: "Keep only pages from one site, such as `irs.gov`."],
+    jurisdiction: [type: :string, doc: "Keep only pages of one jurisdiction: `us` for federal, or `us-` plus a two-letter state or territory code, such as `us-ca` or `us-dc`."],
     k: [type: :integer, doc: "Number of results to return."],
     query: [type: :string, required: true, doc: "Natural-language question or search phrase."]
   ])
 
-  @gov_search_post_key_mapping %{k: "k", query: "query"}
+  @gov_search_post_key_mapping %{cites: "cites", court: "court", court_type: "courtType", domain: "domain", jurisdiction: "jurisdiction", k: "k", query: "query"}
 
   @doc """
   Search the Government Index
