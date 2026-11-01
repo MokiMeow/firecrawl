@@ -14,6 +14,10 @@ import { searchFeedbackController } from "../controllers/v2/search-feedback";
 import { scrapeController } from "../controllers/v2/scrape";
 import { keylessEligibilityController } from "../controllers/v2/keyless-eligibility";
 import {
+  keylessWorldIdDeviceController,
+  keylessWorldIdTokenController,
+} from "../controllers/v2/keyless-world-id";
+import {
   parseController,
   parseMultipartPayloadMiddleware,
 } from "../controllers/v2/parse";
@@ -40,11 +44,12 @@ import { crawlStatusWSController } from "../controllers/v2/crawl-status-ws";
 import { extractController } from "../controllers/v2/extract";
 import { extractStatusController } from "../controllers/v2/extract-status";
 import {
-  authMiddleware,
+  authMiddleware as sharedAuthMiddleware,
   checkCreditsMiddleware,
   blocklistMiddleware,
   scrapeBlocklistMiddleware,
   countryCheck,
+  restrictedOptionsCountryCheck,
   idempotencyMiddleware,
   requestTimingMiddleware,
   wrap,
@@ -119,6 +124,12 @@ import {
   slackStatusController,
 } from "../controllers/v2/slack";
 import { agentListController } from "../controllers/v2/agent-list";
+
+// Every v2 route opts in to the hosted MCP minimums (see AuthenticateOptions
+// in controllers/auth.ts); /v1 routes do not.
+const authMiddleware: typeof sharedAuthMiddleware = (mode, options = {}) =>
+  sharedAuthMiddleware(mode, { ...options, hostedMcpRateLimit: true });
+
 export const v2Router = express.Router();
 expressWs(express()).applyTo(v2Router);
 
@@ -183,6 +194,11 @@ v2Router.use(requestTimingMiddleware("v2"));
 // inside the controller; no auth middleware.
 v2Router.get("/keyless/eligibility", wrap(keylessEligibilityController));
 
+// World ID verification for the keyless tier: a device flow that ends in a
+// credential for the x-firecrawl-world-id header. 404 unless configured.
+v2Router.post("/keyless/world-id/device", wrap(keylessWorldIdDeviceController));
+v2Router.post("/keyless/world-id/token", wrap(keylessWorldIdTokenController));
+
 registerMcpActionLogReadRoute(
   v2Router,
   authMiddleware(RateLimiterMode.Account),
@@ -196,8 +212,10 @@ v2Router.post(
     allowAgentManagedKey: true,
   }),
   inferIntegrationMiddleware,
-  countryCheck,
-  checkCreditsMiddleware(undefined, SEARCH_CREDITS_FEATURE_ID),
+  restrictedOptionsCountryCheck,
+  checkCreditsMiddleware(undefined, SEARCH_CREDITS_FEATURE_ID, {
+    mcpCredits: true,
+  }),
   blocklistMiddleware,
   wrap(searchController),
 );
@@ -206,12 +224,14 @@ v2Router.post(
   "/search/:jobId/feedback",
   authMiddleware(RateLimiterMode.Account),
   validateJobIdParam,
+  inferIntegrationMiddleware,
   wrap(searchFeedbackController),
 );
 
 v2Router.post(
   "/feedback",
   authMiddleware(RateLimiterMode.Account),
+  inferIntegrationMiddleware,
   wrap(feedbackController),
 );
 
@@ -224,7 +244,7 @@ v2Router.get(
 v2Router.post(
   "/parse/upload-url",
   authMiddleware(RateLimiterMode.Scrape, { allowKeyless: true }),
-  countryCheck,
+  restrictedOptionsCountryCheck,
   wrap(parseUploadUrlController),
 );
 
@@ -238,8 +258,8 @@ v2Router.put(
 v2Router.post(
   "/parse",
   authMiddleware(RateLimiterMode.Scrape, { allowKeyless: true }),
-  countryCheck,
-  checkCreditsMiddleware(1),
+  restrictedOptionsCountryCheck,
+  checkCreditsMiddleware(1, undefined, { mcpCredits: true }),
   parsePayloadMiddleware,
   inferIntegrationMiddleware,
   wrap(parseController),
@@ -252,8 +272,8 @@ v2Router.post(
     allowAgentManagedKey: true,
   }),
   inferIntegrationMiddleware,
-  countryCheck,
-  checkCreditsMiddleware(1),
+  restrictedOptionsCountryCheck,
+  checkCreditsMiddleware(1, undefined, { mcpCredits: true }),
   scrapeBlocklistMiddleware,
   wrap(scrapeController),
 );
@@ -268,7 +288,9 @@ v2Router.get(
 v2Router.post(
   "/scrape/:jobId/interact",
   authMiddleware(RateLimiterMode.BrowserExecute, { allowKeyless: true }),
+  countryCheck,
   validateJobIdParam,
+  inferIntegrationMiddleware,
   wrap(scrapeInteractController),
 );
 
@@ -283,8 +305,8 @@ v2Router.post(
   "/batch/scrape",
   authMiddleware(RateLimiterMode.Scrape, { allowAgentManagedKey: true }),
   inferIntegrationMiddleware,
-  countryCheck,
-  checkCreditsMiddleware(),
+  restrictedOptionsCountryCheck,
+  checkCreditsMiddleware(undefined, undefined, { mcpCredits: true }),
   blocklistMiddleware,
   wrap(batchScrapeController),
 );
@@ -293,7 +315,7 @@ v2Router.post(
   "/map",
   authMiddleware(RateLimiterMode.Map),
   inferIntegrationMiddleware,
-  checkCreditsMiddleware(1),
+  checkCreditsMiddleware(1, undefined, { mcpCredits: true }),
   blocklistMiddleware,
   wrap(mapController),
 );
@@ -302,8 +324,8 @@ v2Router.post(
   "/crawl",
   authMiddleware(RateLimiterMode.Crawl),
   inferIntegrationMiddleware,
-  countryCheck,
-  checkCreditsMiddleware(),
+  restrictedOptionsCountryCheck,
+  checkCreditsMiddleware(undefined, undefined, { mcpCredits: true }),
   scrapeBlocklistMiddleware,
   idempotencyMiddleware,
   wrap(crawlController),
@@ -390,7 +412,7 @@ v2Router.post(
   authMiddleware(RateLimiterMode.Extract),
   inferIntegrationMiddleware,
   deprecationMiddleware("v2_extract"),
-  countryCheck,
+  restrictedOptionsCountryCheck,
   checkCreditsMiddleware(20),
   blocklistMiddleware,
   wrap(extractController),
@@ -555,7 +577,7 @@ v2Router.post(
 v2Router.post(
   "/monitor",
   authMiddleware(RateLimiterMode.Crawl),
-  countryCheck,
+  restrictedOptionsCountryCheck,
   checkCreditsMiddleware(1),
   blocklistMiddleware,
   wrap(createMonitorController),
@@ -584,7 +606,7 @@ v2Router.get(
 v2Router.patch(
   "/monitor/:monitorId",
   authMiddleware(RateLimiterMode.Crawl),
-  countryCheck,
+  restrictedOptionsCountryCheck,
   checkCreditsMiddleware(1),
   blocklistMiddleware,
   wrap(updateMonitorController),
@@ -599,7 +621,7 @@ v2Router.delete(
 v2Router.post(
   "/monitor/:monitorId/run",
   authMiddleware(RateLimiterMode.Crawl),
-  countryCheck,
+  restrictedOptionsCountryCheck,
   checkCreditsMiddleware(1),
   blocklistMiddleware,
   wrap(runMonitorController),
@@ -662,6 +684,7 @@ v2Router.get(
 v2Router.post(
   ["/browser/:sessionId/execute", "/interact/:sessionId/execute"],
   authMiddleware(RateLimiterMode.BrowserExecute),
+  countryCheck,
   wrap(browserExecuteController),
 );
 

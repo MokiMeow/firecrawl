@@ -205,6 +205,243 @@ describe("MCP action log contract", () => {
     );
   });
 
+  it("stores an optional coarse error code and rejects anything but snake_case", () => {
+    expect(input().error_code).toBeNull();
+    expect(
+      input({ status: "error", error_code: "rate_limited" }).error_code,
+    ).toBe("rate_limited");
+    expect(
+      input({ status: "error", error_code: "scrape_all_engines_failed" })
+        .error_code,
+    ).toBe("scrape_all_engines_failed");
+    expect(input({ error_code: "" }).error_code).toBeNull();
+    for (const value of [
+      "Rate limit exceeded",
+      "https://example.com",
+      "RATE_LIMITED",
+      "rate_",
+      "rate__limited",
+      "fcmcp_abc123",
+      "x".repeat(65),
+      429,
+    ]) {
+      expect(() => input({ error_code: value })).toThrow(
+        "error_code must be a lowercase snake_case code",
+      );
+    }
+  });
+
+  it("stores the optional per-call fields the hosted MCP reads itself", () => {
+    expect(input()).toMatchObject({
+      mcp_origin: null,
+      mcp_client: null,
+      mcp_client_source: null,
+      llm_model: null,
+      duration_ms: null,
+      invalid_arguments: [],
+      rate_limit_retry: null,
+    });
+    expect(
+      input({
+        status: "error",
+        error_class: "InvalidArguments",
+        mcp_origin: "mcp-ua-codex-cli-rs",
+        mcp_client: "codex",
+        mcp_client_source: "user_agent",
+        llm_model: " gpt-6.1-sol ",
+        duration_ms: 55,
+        invalid_arguments: ["limit:invalid_type", "*:unrecognized_keys"],
+      }),
+    ).toMatchObject({
+      mcp_origin: "mcp-ua-codex-cli-rs",
+      mcp_client: "codex",
+      mcp_client_source: "user_agent",
+      llm_model: "gpt-6.1-sol",
+      duration_ms: 55,
+      invalid_arguments: ["limit:invalid_type", "*:unrecognized_keys"],
+    });
+    expect(input({ duration_ms: 0 }).duration_ms).toBe(0);
+    for (const rate_limit_retry of [
+      "recovered",
+      "failed",
+      "over_cap",
+      "not_retryable",
+    ]) {
+      expect(input({ rate_limit_retry }).rate_limit_retry).toBe(
+        rate_limit_retry,
+      );
+    }
+    expect(input({ invalid_arguments: ["(root):invalid_type"] })).toMatchObject(
+      { invalid_arguments: ["(root):invalid_type"] },
+    );
+  });
+
+  it("rejects malformed per-call fields", () => {
+    expect(() => input({ mcp_client_source: "header" })).toThrow(
+      "mcp_client_source must be client_info, user_agent or oauth",
+    );
+    for (const duration_ms of [-1, 1.5, "55", 2_147_483_648]) {
+      expect(() => input({ duration_ms })).toThrow(
+        "duration_ms must be a non-negative integer",
+      );
+    }
+    for (const invalid_arguments of [
+      "limit:invalid_type",
+      ["limit"],
+      ["limit:Invalid Type"],
+      ["my secret value:custom"],
+      Array.from({ length: 11 }, (_, i) => `a${i}:invalid_type`),
+    ]) {
+      expect(() => input({ invalid_arguments })).toThrow(
+        "invalid_arguments must be at most 10 <argument>:<issue> labels",
+      );
+    }
+    for (const rate_limit_retry of ["retrying", "RECOVERED", 1]) {
+      expect(() => input({ rate_limit_retry })).toThrow(
+        "rate_limit_retry must be recovered, failed, over_cap or not_retryable",
+      );
+    }
+    expect(() => input({ llm_model: "m".repeat(129) })).toThrow(
+      "llm_model must be at most 128 characters",
+    );
+    expect(() => input({ mcp_client: "fc-secret" })).toThrow(
+      "mcp_client must not contain secret-like values",
+    );
+  });
+
+  it("stores optional session and thread ids with their sources", () => {
+    expect(input()).toMatchObject({
+      session_id: null,
+      session_source: null,
+      thread_id: null,
+      thread_source: null,
+    });
+    expect(
+      input({
+        session_id: "AbC-123_xyz.789:abcdefg",
+        session_source: "token",
+        thread_id: "0b7c9a8e-1f2d-4e3c-9b8a-7f6e5d4c3b2a",
+        thread_source: "argument",
+      }),
+    ).toMatchObject({
+      session_id: "AbC-123_xyz.789:abcdefg",
+      session_source: "token",
+      thread_id: "0b7c9a8e-1f2d-4e3c-9b8a-7f6e5d4c3b2a",
+      thread_source: "argument",
+    });
+    expect(
+      input({
+        session_id: "s".repeat(128),
+        thread_id: "t",
+        thread_source: "minted",
+      }),
+    ).toMatchObject({
+      session_id: "s".repeat(128),
+      session_source: null,
+      thread_id: "t",
+      thread_source: "minted",
+    });
+    expect(
+      input({
+        thread_id: "0f8fad5b-d9cb-869f-a165-70867728950e",
+        thread_source: "client",
+      }),
+    ).toMatchObject({
+      thread_id: "0f8fad5b-d9cb-869f-a165-70867728950e",
+      thread_source: "client",
+    });
+  });
+
+  it("stores a credential-like session or thread id as null instead of rejecting the event", async () => {
+    ch.logMcpActionLog.mockReset().mockResolvedValue(undefined);
+    await expect(
+      recordMcpActionLog(
+        input({
+          session_id: "fc-FAKESECRET1234567890",
+          session_source: "trace",
+        }),
+      ),
+    ).resolves.toEqual({ disposition: "accepted", id: REQUEST_ID });
+    expect(ch.logMcpActionLog.mock.calls[0][0]).toMatchObject({
+      id: REQUEST_ID,
+      session_id: null,
+      session_source: null,
+    });
+
+    expect(
+      input({
+        session_id: "fc-FAKESECRET1234567890",
+        session_source: "token",
+        thread_id: "sk-FAKESECRET1234567890",
+        thread_source: "argument",
+      }),
+    ).toMatchObject({
+      session_id: null,
+      session_source: null,
+      thread_id: null,
+      thread_source: null,
+    });
+    expect(
+      input({
+        session_id: "fc-FAKESECRET1234567890",
+        thread_id: "thread-1",
+        thread_source: "minted",
+      }),
+    ).toMatchObject({
+      session_id: null,
+      thread_id: "thread-1",
+      thread_source: "minted",
+    });
+    for (const id of [
+      "x_fc-FAKESECRET1234567890",
+      "_sk-FAKESECRET1234567890",
+      "s_fcmcp_FAKESECRET1234567890",
+    ]) {
+      expect(
+        input({
+          session_id: id,
+          session_source: "token",
+          thread_id: id,
+          thread_source: "client",
+        }),
+      ).toMatchObject({
+        session_id: null,
+        session_source: null,
+        thread_id: null,
+        thread_source: null,
+      });
+    }
+    expect(() =>
+      input({
+        session_id: "fc-FAKESECRET1234567890",
+        session_source: "header",
+      }),
+    ).toThrow("session_source must be one of token, trace, sse");
+  });
+
+  it("rejects malformed session and thread fields", () => {
+    for (const session_id of ["s".repeat(129), "has space", "a/b", 42]) {
+      expect(() => input({ session_id })).toThrow(
+        "session_id must be 1-128 letters, digits, dots, underscores, colons or hyphens",
+      );
+    }
+    expect(() => input({ thread_id: "é" })).toThrow(
+      "thread_id must be 1-128 letters, digits, dots, underscores, colons or hyphens",
+    );
+    expect(() =>
+      input({ session_id: "abc", session_source: "header" }),
+    ).toThrow("session_source must be one of token, trace, sse");
+    expect(() => input({ thread_id: "abc", thread_source: "Session" })).toThrow(
+      "thread_source must be one of argument, session, minted, client",
+    );
+    expect(() => input({ session_source: "token" })).toThrow(
+      "session_source requires session_id",
+    );
+    expect(() => input({ thread_source: "session" })).toThrow(
+      "thread_source requires thread_id",
+    );
+  });
+
   it("validates API-key and OAuth actors against the claimed team", async () => {
     const apiKeyDb = {
       select: vi.fn(() => ({
@@ -279,7 +516,19 @@ describe("MCP action log contract", () => {
         input({
           objective: "Find the refund policy",
           api_job_id: REQUEST_ID,
+          error_code: "rate_limited",
           user_agent: "Claude/1.0",
+          mcp_origin: "mcp-ua-codex-cli-rs",
+          mcp_client: "codex-cli-rs",
+          mcp_client_source: "user_agent",
+          llm_model: "gpt-6.1-sol",
+          duration_ms: 55,
+          invalid_arguments: ["limit:invalid_type"],
+          rate_limit_retry: "recovered",
+          session_id: "AbC-123_xyz.789:abcdefg",
+          session_source: "trace",
+          thread_id: "AbC-123_xyz.789:abcdefg",
+          thread_source: "session",
         }),
       ),
     ).resolves.toEqual({ disposition: "accepted", id: REQUEST_ID });
@@ -291,6 +540,18 @@ describe("MCP action log contract", () => {
       api_key_id: "123",
       objective: "Find the refund policy",
       api_job_id: REQUEST_ID,
+      error_code: "rate_limited",
+      mcp_origin: "mcp-ua-codex-cli-rs",
+      mcp_client: "codex-cli-rs",
+      mcp_client_source: "user_agent",
+      llm_model: "gpt-6.1-sol",
+      duration_ms: 55,
+      invalid_arguments: ["limit:invalid_type"],
+      rate_limit_retry: "recovered",
+      session_id: "AbC-123_xyz.789:abcdefg",
+      session_source: "trace",
+      thread_id: "AbC-123_xyz.789:abcdefg",
+      thread_source: "session",
     });
     expect(row).not.toHaveProperty("user_agent");
 

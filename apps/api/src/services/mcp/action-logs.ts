@@ -19,6 +19,23 @@ const SECRET_PATTERN =
   /(?:\bBearer\s+\S+|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b|\b(?:sk-|fc-|fco_|fcr_|fcmcp_)[A-Za-z0-9_-]+)/i;
 const SECRET_PATTERN_ALL = new RegExp(SECRET_PATTERN.source, "gi");
 const OBJECTIVE_MAX_LENGTH = 1000;
+const ERROR_CODE_PATTERN = /^(?=.{2,64}$)[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
+const MCP_CLIENT_SOURCES = ["client_info", "user_agent", "oauth"] as const;
+const RATE_LIMIT_RETRY_OUTCOMES = [
+  "recovered",
+  "failed",
+  "over_cap",
+  "not_retryable",
+] as const;
+const DURATION_MS_MAX = 2_147_483_647;
+const LINEAGE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const SESSION_SOURCES = ["token", "trace", "sse"] as const;
+const THREAD_SOURCES = ["argument", "session", "minted", "client"] as const;
+const LINEAGE_ID_SECRET_PATTERN =
+  /(?:^|[^A-Za-z0-9])(?:sk-|fc-|fco_|fcr_|fcmcp_)/i;
+const INVALID_ARGUMENTS_MAX = 10;
+const INVALID_ARGUMENT_PATTERN =
+  /^(?:\(root\)|\*|[A-Za-z0-9_.-]{1,64}):[a-z_]{1,40}$/;
 const RETENTION_DAYS = 30;
 const ALLOWED_FIELDS = new Set([
   "team_id",
@@ -33,9 +50,21 @@ const ALLOWED_FIELDS = new Set([
   "client_name",
   "client_version",
   "error_class",
+  "error_code",
   "resource",
   "objective",
   "api_job_id",
+  "mcp_origin",
+  "mcp_client",
+  "mcp_client_source",
+  "llm_model",
+  "duration_ms",
+  "invalid_arguments",
+  "rate_limit_retry",
+  "session_id",
+  "session_source",
+  "thread_id",
+  "thread_source",
 ]);
 
 export class McpActionLogValidationError extends Error {}
@@ -84,6 +113,18 @@ function text(value: unknown, field: string, max = 128, required = false) {
   return normalized || null;
 }
 
+function errorCode(value: unknown) {
+  if (value == null || value === "") return null;
+  if (
+    typeof value !== "string" ||
+    !ERROR_CODE_PATTERN.test(value) ||
+    SECRET_PATTERN.test(value)
+  ) {
+    invalid("error_code must be a lowercase snake_case code");
+  }
+  return value;
+}
+
 function objective(value: unknown) {
   if (value == null) return null;
   if (typeof value !== "string") invalid("objective must be a string");
@@ -99,6 +140,64 @@ function objective(value: unknown) {
   return normalized || null;
 }
 
+function durationMs(value: unknown) {
+  if (value == null) return null;
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < 0 ||
+    value > DURATION_MS_MAX
+  ) {
+    invalid("duration_ms must be a non-negative integer");
+  }
+  return value;
+}
+
+function invalidArguments(value: unknown) {
+  if (value == null) return [];
+  if (
+    !Array.isArray(value) ||
+    value.length > INVALID_ARGUMENTS_MAX ||
+    !value.every(
+      label =>
+        typeof label === "string" && INVALID_ARGUMENT_PATTERN.test(label),
+    )
+  ) {
+    invalid(
+      `invalid_arguments must be at most ${INVALID_ARGUMENTS_MAX} <argument>:<issue> labels`,
+    );
+  }
+  return value as string[];
+}
+
+function lineage<T extends string>(
+  payload: Record<string, unknown>,
+  kind: "session" | "thread",
+  values: readonly T[],
+): { id: string | null; source: T | null } {
+  const id = payload[`${kind}_id`];
+  const source = payload[`${kind}_source`];
+  const hasId = id != null && id !== "";
+  const hasSource = source != null && source !== "";
+  if (hasId && (typeof id !== "string" || !LINEAGE_ID_PATTERN.test(id))) {
+    invalid(
+      `${kind}_id must be 1-128 letters, digits, dots, underscores, colons or hyphens`,
+    );
+  }
+  if (hasSource && !values.includes(source as T)) {
+    invalid(`${kind}_source must be one of ${values.join(", ")}`);
+  }
+  if (hasSource && !hasId) invalid(`${kind}_source requires ${kind}_id`);
+  const usable =
+    hasId &&
+    !SECRET_PATTERN.test(id as string) &&
+    !LINEAGE_ID_SECRET_PATTERN.test(id as string);
+  return {
+    id: usable ? (id as string) : null,
+    source: usable && hasSource ? (source as T) : null,
+  };
+}
+
 type McpActionLogInput = {
   team_id: string;
   user_id: string | null;
@@ -111,9 +210,21 @@ type McpActionLogInput = {
   client_name: string | null;
   client_version: string | null;
   error_class: string | null;
+  error_code: string | null;
   resource: string;
   objective: string | null;
   api_job_id: string | null;
+  mcp_origin: string | null;
+  mcp_client: string | null;
+  mcp_client_source: (typeof MCP_CLIENT_SOURCES)[number] | null;
+  llm_model: string | null;
+  duration_ms: number | null;
+  invalid_arguments: string[];
+  rate_limit_retry: (typeof RATE_LIMIT_RETRY_OUTCOMES)[number] | null;
+  session_id: string | null;
+  session_source: (typeof SESSION_SOURCES)[number] | null;
+  thread_id: string | null;
+  thread_source: (typeof THREAD_SOURCES)[number] | null;
 };
 
 type McpActionLogRow = {
@@ -161,10 +272,32 @@ export function normalizeMcpActionLogInput(
     if (!userId) invalid("user_id is required for oauth events");
     if (!oauthClientId) invalid("oauth_client_id is required for oauth events");
   }
+  const mcpClientSource = payload.mcp_client_source ?? null;
+  if (
+    mcpClientSource !== null &&
+    !MCP_CLIENT_SOURCES.includes(
+      mcpClientSource as (typeof MCP_CLIENT_SOURCES)[number],
+    )
+  ) {
+    invalid("mcp_client_source must be client_info, user_agent or oauth");
+  }
+  const rateLimitRetry = payload.rate_limit_retry ?? null;
+  if (
+    rateLimitRetry !== null &&
+    !RATE_LIMIT_RETRY_OUTCOMES.includes(
+      rateLimitRetry as (typeof RATE_LIMIT_RETRY_OUTCOMES)[number],
+    )
+  ) {
+    invalid(
+      "rate_limit_retry must be recovered, failed, over_cap or not_retryable",
+    );
+  }
   const resource = text(payload.resource, "resource", 128, true)!;
   if (!RESOURCES.has(resource)) {
     invalid("resource must be a canonical hosted MCP URL");
   }
+  const session = lineage(payload, "session", SESSION_SOURCES);
+  const thread = lineage(payload, "thread", THREAD_SOURCES);
   return {
     team_id: uuid(payload.team_id, "team_id")!,
     user_id: userId,
@@ -177,9 +310,22 @@ export function normalizeMcpActionLogInput(
     client_name: text(payload.client_name, "client_name"),
     client_version: text(payload.client_version, "client_version"),
     error_class: text(payload.error_class, "error_class"),
+    error_code: errorCode(payload.error_code),
     resource,
     objective: objective(payload.objective),
     api_job_id: text(payload.api_job_id, "api_job_id"),
+    mcp_origin: text(payload.mcp_origin, "mcp_origin"),
+    mcp_client: text(payload.mcp_client, "mcp_client"),
+    mcp_client_source:
+      mcpClientSource as McpActionLogInput["mcp_client_source"],
+    llm_model: text(payload.llm_model, "llm_model"),
+    duration_ms: durationMs(payload.duration_ms),
+    invalid_arguments: invalidArguments(payload.invalid_arguments),
+    rate_limit_retry: rateLimitRetry as McpActionLogInput["rate_limit_retry"],
+    session_id: session.id,
+    session_source: session.source,
+    thread_id: thread.id,
+    thread_source: thread.source,
   };
 }
 

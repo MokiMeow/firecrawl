@@ -39,6 +39,8 @@ export async function authorizeProviders(
   calls: ProviderCall[],
   flags: TeamFlags | null | undefined,
   orgId: string | null = null,
+  clientIp?: string,
+  billingCountry?: string,
 ): Promise<ExchangeResponse | undefined> {
   const providers = [...new Set(calls.map(call => call.provider))];
   const response = await exchangeRequest({
@@ -46,6 +48,8 @@ export async function authorizeProviders(
     path: "/v1/provider-terms/requirements",
     body: { providers },
     timeoutMs: 10000,
+    clientIp,
+    billingCountry,
   }).catch(() => undefined);
   if (response?.status === 404)
     return refusal(404, "Unknown provider. No provider was executed.", {
@@ -83,7 +87,10 @@ export async function authorizeProviders(
         item.terms &&
         orgId !== null
       ) {
-        ledger ??= await acceptedProviders(teamId, orgId);
+        ledger ??= await acceptedProviders(teamId, orgId, undefined, {
+          clientIp,
+          billingCountry,
+        });
         const accepted = ledger.get(item.provider);
         if (
           matchesAcceptance(accepted, item.terms) &&
@@ -107,7 +114,10 @@ export async function authorizeProviders(
     )
       continue;
     if (orgId !== null) {
-      ledger ??= await acceptedProviders(teamId, orgId);
+      ledger ??= await acceptedProviders(teamId, orgId, undefined, {
+        clientIp,
+        billingCountry,
+      });
       const accepted = ledger.get(item.provider);
       if (matchesAcceptance(accepted, item.terms)) continue;
     }
